@@ -1,0 +1,17 @@
+{
+  "name": "nim-proxy",
+  "version": "1.0.0",
+  "description": "Simple CORS proxy for NVIDIA NIM API — use your own API key",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}

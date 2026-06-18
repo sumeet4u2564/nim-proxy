@@ -31,11 +31,24 @@ app.post("/v1/chat/completions", (req, res) => {
     return res.status(401).json({ error: { message: "No API key. Put your nvapi-... key in the API Key field.", type: "auth_error" } });
   }
 
+  // reasoning query param: ?reasoning=force or ?reasoning=visible
+  const reasoning = req.query.reasoning;
+
   // Force stream off — Janitor AI proxy mode works better with full JSON
-  const body = { ...req.body, stream: false };
+  let body = { ...req.body, stream: false };
+
+  if (reasoning === "force") {
+    // Inject thinking config — forces the model to reason even if it wouldn't by default
+    body.thinking = { type: "enabled", budget_tokens: 5000 };
+    console.log("→ reasoning=force: thinking enabled");
+  }
+
+  // For reasoning=visible we don't change the request, just let <think> tags
+  // pass through naturally in the response content
+
   const bodyStr = JSON.stringify(body);
 
-  console.log("→ POST /v1/chat/completions, model:", body.model);
+  console.log("→ POST /v1/chat/completions, model:", body.model, "| reasoning:", reasoning || "off");
 
   const options = {
     hostname: NIM_HOST,

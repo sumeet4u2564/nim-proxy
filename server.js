@@ -20,7 +20,18 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: "10mb" }));
 
-app.get("/", (req, res) => res.json({ status: "ok", info: "NIM proxy — set proxy URL to /v1/chat/completions in Janitor AI" }));
+app.get("/", (req, res) => res.json({
+  status: "ok",
+  trigger_words: {
+    "!long": "forces min 500 tokens in response (strip from message automatically)",
+  },
+  url_params: {
+    "?reasoning=force": "force thinking mode on",
+    "?reasoning=visible": "show <think> tags if model produces them",
+    "?min_tokens=200": "minimum response length in tokens",
+    "?system=your+prompt+here": "inject a system prompt at the top",
+  }
+}));
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 app.post("/v1/chat/completions", (req, res) => {
@@ -31,24 +42,66 @@ app.post("/v1/chat/completions", (req, res) => {
     return res.status(401).json({ error: { message: "No API key. Put your nvapi-... key in the API Key field.", type: "auth_error" } });
   }
 
-  // reasoning query param: ?reasoning=force or ?reasoning=visible
+  // URL query params
   const reasoning = req.query.reasoning;
+  const minTokensParam = req.query.min_tokens ? parseInt(req.query.min_tokens) : null;
+  const systemInject = req.query.system ? decodeURIComponent(req.query.system) : null;
 
-  // Force stream off — Janitor AI proxy mode works better with full JSON
+  // Start with the body Janitor AI sent, force stream off
   let body = { ...req.body, stream: false };
 
+  // --- Trigger word detection in the last user message ---
+  let triggeredMinTokens = minTokensParam;
+  if (body.messages && body.messages.length > 0) {
+    const lastMsg = { ...body.messages[body.messages.length - 1] };
+    if (lastMsg.role === "user" && typeof lastMsg.content === "string") {
+
+      // !long — force 500 min tokens
+      if (lastMsg.content.includes("!long")) {
+        triggeredMinTokens = 500;
+        lastMsg.content = lastMsg.content.replace(/!long/g, "").trim();
+        console.log("→ trigger: !long → min_tokens=500");
+      }
+
+    }
+    // Put the cleaned message back
+    body.messages = [
+      ...body.messages.slice(0, -1),
+      lastMsg,
+    ];
+  }
+
+  // Apply min_tokens (from trigger word or URL param)
+  if (triggeredMinTokens && !isNaN(triggeredMinTokens)) {
+    body.min_tokens = triggeredMinTokens;
+  }
+
+  // Inject system prompt from URL param
+  if (systemInject) {
+    const existing = body.messages || [];
+    const hasSystem = existing.length > 0 && existing[0].role === "system";
+    if (hasSystem) {
+      body.messages = [
+        { role: "system", content: systemInject + "\n\n" + existing[0].content },
+        ...existing.slice(1),
+      ];
+    } else {
+      body.messages = [
+        { role: "system", content: systemInject },
+        ...existing,
+      ];
+    }
+    console.log("→ system prompt injected");
+  }
+
+  // Force thinking mode from URL param
   if (reasoning === "force") {
-    // Inject thinking config — forces the model to reason even if it wouldn't by default
     body.thinking = { type: "enabled", budget_tokens: 5000 };
     console.log("→ reasoning=force: thinking enabled");
   }
 
-  // For reasoning=visible we don't change the request, just let <think> tags
-  // pass through naturally in the response content
-
   const bodyStr = JSON.stringify(body);
-
-  console.log("→ POST /v1/chat/completions, model:", body.model, "| reasoning:", reasoning || "off");
+  console.log("→ POST /v1/chat/completions | model:", body.model, "| min_tokens:", body.min_tokens || "unset", "| reasoning:", reasoning || "off");
 
   const options = {
     hostname: NIM_HOST,
@@ -66,7 +119,7 @@ app.post("/v1/chat/completions", (req, res) => {
     let data = "";
     nimRes.on("data", (chunk) => { data += chunk; });
     nimRes.on("end", () => {
-      console.log("← NIM status:", nimRes.statusCode, "body length:", data.length);
+      console.log("← NIM status:", nimRes.statusCode, "| body length:", data.length);
       try {
         const parsed = JSON.parse(data);
         res.status(nimRes.statusCode).json(parsed);
@@ -91,7 +144,7 @@ app.post("/v1/chat/completions", (req, res) => {
   nimReq.end();
 });
 
-// Also handle /v1/models so Janitor AI can list models
+// /v1/models so Janitor AI can validate the connection
 app.get("/v1/models", (req, res) => {
   const authHeader = req.headers["authorization"] || req.headers["x-api-key"] || "";
   const apiKey = authHeader.replace(/^Bearer\s+/i, "").trim();

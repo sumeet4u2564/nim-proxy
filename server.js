@@ -58,9 +58,9 @@ app.post("/v1/chat/completions", (req, res) => {
 
       // !long — force 500 min tokens
       if (lastMsg.content.includes("!long")) {
-        triggeredMinTokens = 500;
+        triggeredMinTokens = 670;
         lastMsg.content = lastMsg.content.replace(/!long/g, "").trim();
-        console.log("→ trigger: !long → min_tokens=500");
+        console.log("→ trigger: !long → min_tokens=670 (~500 words)");
       }
 
     }

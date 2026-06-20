@@ -23,12 +23,12 @@ app.use(express.json({ limit: "10mb" }));
 app.get("/", (req, res) => res.json({
   status: "ok",
   trigger_words: {
-    "!long": "forces min 500 tokens in response (strip from message automatically)",
+    "!long": "forces min 400 tokens in response (strip from message automatically)",
   },
   url_params: {
     "?reasoning=force": "force thinking mode on",
     "?reasoning=visible": "show <think> tags if model produces them",
-    "?min_tokens=200": "minimum response length in tokens",
+    "?min_tokens=400": "minimum response length in tokens",
     "?system=your+prompt+here": "inject a system prompt at the top",
   }
 }));
@@ -56,11 +56,11 @@ app.post("/v1/chat/completions", (req, res) => {
     const lastMsg = { ...body.messages[body.messages.length - 1] };
     if (lastMsg.role === "user" && typeof lastMsg.content === "string") {
 
-      // !long — force 500 min tokens
+      // !long — force 400 min tokens
       if (lastMsg.content.includes("!long")) {
-        triggeredMinTokens = 600;
+        triggeredMinTokens = 400;
         lastMsg.content = lastMsg.content.replace(/!long/g, "").trim();
-        console.log("→ trigger: !long → min_tokens=600 (~500 words)");
+        console.log("→ trigger: !long → min_tokens=400 (~300 words)");
       }
 
     }

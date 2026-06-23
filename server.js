@@ -1,5 +1,4 @@
 const express = require("express");
-const cors = require("cors");
 const https = require("https");
 
 const app = express();
@@ -23,60 +22,134 @@ app.use(express.json({ limit: "10mb" }));
 app.get("/", (req, res) => res.json({
   status: "ok",
   trigger_words: {
-    "!long": "forces min 400 tokens in response (strip from message automatically)",
+    "!long": "forces min 400 tokens in response (stripped from message automatically)",
   },
   url_params: {
     "?reasoning=force": "force thinking mode on",
     "?reasoning=visible": "show <think> tags if model produces them",
     "?min_tokens=400": "minimum response length in tokens",
     "?system=your+prompt+here": "inject a system prompt at the top",
+    "?stream=false": "disable streaming (not recommended — slower)",
   }
 }));
+
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-app.post("/v1/chat/completions", (req, res) => {
+// ─── Helper: forward a request to NIM ────────────────────────────────────────
+function nimRequest(path, method, apiKey, bodyStr) {
+  return new Promise((resolve, reject) => {
+    const headers = {
+      "Authorization": `Bearer ${apiKey}`,
+      "Accept": "application/json",
+    };
+    if (bodyStr) {
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(bodyStr);
+    }
+
+    const req = https.request(
+      { hostname: NIM_HOST, path: `${NIM_BASE_PATH}${path}`, method, headers },
+      (nimRes) => {
+        let data = "";
+        nimRes.on("data", (chunk) => { data += chunk; });
+        nimRes.on("end", () => resolve({ status: nimRes.statusCode, body: data }));
+      }
+    );
+    req.on("error", reject);
+    req.setTimeout(300_000, () => { req.destroy(); reject(new Error("timeout")); });
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+// ─── Helper: forward a STREAMING request to NIM ──────────────────────────────
+function nimStreamRequest(path, apiKey, bodyStr, res) {
+  return new Promise((resolve, reject) => {
+    const headers = {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "Accept": "text/event-stream",
+      "Content-Length": Buffer.byteLength(bodyStr),
+    };
+
+    const req = https.request(
+      { hostname: NIM_HOST, path: `${NIM_BASE_PATH}${path}`, method: "POST", headers },
+      (nimRes) => {
+        // If NIM returns an error status, collect the body and surface it
+        if (nimRes.statusCode !== 200) {
+          let errData = "";
+          nimRes.on("data", (c) => { errData += c; });
+          nimRes.on("end", () => reject({ status: nimRes.statusCode, body: errData }));
+          return;
+        }
+
+        // Pass SSE headers through to the client
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+          "Access-Control-Allow-Origin": "*",
+        });
+
+        // Pipe each chunk straight to the client as it arrives
+        nimRes.on("data", (chunk) => res.write(chunk));
+        nimRes.on("end", () => { res.end(); resolve(); });
+      }
+    );
+
+    req.on("error", reject);
+
+    // 5-minute hard timeout — enough for the longest DeepSeek responses
+    req.setTimeout(300_000, () => {
+      req.destroy();
+      reject(new Error("NIM stream timed out after 5 minutes"));
+    });
+
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
+// ─── POST /v1/chat/completions ────────────────────────────────────────────────
+app.post("/v1/chat/completions", async (req, res) => {
   const authHeader = req.headers["authorization"] || req.headers["x-api-key"] || "";
   const apiKey = authHeader.replace(/^Bearer\s+/i, "").trim();
 
   if (!apiKey) {
-    return res.status(401).json({ error: { message: "No API key. Put your nvapi-... key in the API Key field.", type: "auth_error" } });
+    return res.status(401).json({
+      error: { message: "No API key. Put your nvapi-... key in the API Key field.", type: "auth_error" }
+    });
   }
 
-  // URL query params
-  const reasoning = req.query.reasoning;
+  // ── URL query params ──
+  const reasoning    = req.query.reasoning;
   const minTokensParam = req.query.min_tokens ? parseInt(req.query.min_tokens) : null;
   const systemInject = req.query.system ? decodeURIComponent(req.query.system) : null;
+  // Streaming: on by default; pass ?stream=false to disable
+  const wantStream   = req.query.stream !== "false";
 
-  // Start with the body Janitor AI sent, force stream off
-  let body = { ...req.body, stream: false };
+  // ── Build body ──
+  let body = { ...req.body };
 
-  // --- Trigger word detection in the last user message ---
+  // ── Trigger word detection ──
   let triggeredMinTokens = minTokensParam;
-  if (body.messages && body.messages.length > 0) {
+  if (body.messages?.length > 0) {
     const lastMsg = { ...body.messages[body.messages.length - 1] };
     if (lastMsg.role === "user" && typeof lastMsg.content === "string") {
-
-      // !long — force 400 min tokens
       if (lastMsg.content.includes("!long")) {
         triggeredMinTokens = 400;
         lastMsg.content = lastMsg.content.replace(/!long/g, "").trim();
-        console.log("→ trigger: !long → min_tokens=400 (~300 words)");
+        console.log("→ trigger: !long → min_tokens=400");
       }
-
     }
-    // Put the cleaned message back
-    body.messages = [
-      ...body.messages.slice(0, -1),
-      lastMsg,
-    ];
+    body.messages = [...body.messages.slice(0, -1), lastMsg];
   }
 
-  // Apply min_tokens (from trigger word or URL param)
   if (triggeredMinTokens && !isNaN(triggeredMinTokens)) {
     body.min_tokens = triggeredMinTokens;
   }
 
-  // Inject system prompt from URL param
+  // ── Inject system prompt ──
   if (systemInject) {
     const existing = body.messages || [];
     const hasSystem = existing.length > 0 && existing[0].role === "system";
@@ -86,92 +159,79 @@ app.post("/v1/chat/completions", (req, res) => {
         ...existing.slice(1),
       ];
     } else {
-      body.messages = [
-        { role: "system", content: systemInject },
-        ...existing,
-      ];
+      body.messages = [{ role: "system", content: systemInject }, ...existing];
     }
     console.log("→ system prompt injected");
   }
 
-  // Force thinking mode from URL param
+  // ── Force thinking mode ──
   if (reasoning === "force") {
     body.thinking = { type: "enabled", budget_tokens: 5000 };
     console.log("→ reasoning=force: thinking enabled");
   }
 
+  // ── Streaming vs non-streaming ──
+  body.stream = wantStream;
+
   const bodyStr = JSON.stringify(body);
-  console.log("→ POST /v1/chat/completions | model:", body.model, "| min_tokens:", body.min_tokens || "unset", "| reasoning:", reasoning || "off");
+  console.log(
+    `→ POST /v1/chat/completions | model: ${body.model} | min_tokens: ${body.min_tokens ?? "unset"} | reasoning: ${reasoning ?? "off"} | stream: ${wantStream}`
+  );
 
-  const options = {
-    hostname: NIM_HOST,
-    path: `${NIM_BASE_PATH}/chat/completions`,
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "Accept": "application/json",
-      "Content-Length": Buffer.byteLength(bodyStr),
-    },
-  };
+  // ── Streaming path ──
+  if (wantStream) {
+    try {
+      await nimStreamRequest("/chat/completions", apiKey, bodyStr, res);
+    } catch (err) {
+      console.error("Stream error:", err);
+      // If headers not sent yet, return a proper JSON error
+      if (!res.headersSent) {
+        const status = err?.status ?? 504;
+        let message = err?.body ?? err?.message ?? "Unknown streaming error";
+        // Try to pass the NIM error JSON through if parseable
+        try { message = JSON.parse(message); } catch (_) { /* keep as string */ }
+        res.status(status).json({ error: { message, type: "proxy_error" } });
+      }
+    }
+    return;
+  }
 
-  const nimReq = https.request(options, (nimRes) => {
-    let data = "";
-    nimRes.on("data", (chunk) => { data += chunk; });
-    nimRes.on("end", () => {
-      console.log("← NIM status:", nimRes.statusCode, "| body length:", data.length);
-      try {
-        const parsed = JSON.parse(data);
-        res.status(nimRes.statusCode).json(parsed);
-      } catch (e) {
-        console.error("Failed to parse NIM response:", data.slice(0, 200));
-        res.status(500).json({ error: { message: "Failed to parse NIM response: " + data.slice(0, 100), type: "proxy_error" } });
+  // ── Non-streaming path (fallback) ──
+  try {
+    const { status, body: rawBody } = await nimRequest("/chat/completions", "POST", apiKey, bodyStr);
+    console.log(`← NIM status: ${status} | body length: ${rawBody.length}`);
+    try {
+      res.status(status).json(JSON.parse(rawBody));
+    } catch (_) {
+      res.status(500).json({ error: { message: "Failed to parse NIM response: " + rawBody.slice(0, 100), type: "proxy_error" } });
+    }
+  } catch (err) {
+    console.error("NIM request error:", err.message);
+    const isTimeout = err.message === "timeout";
+    res.status(isTimeout ? 504 : 500).json({
+      error: {
+        message: isTimeout ? "Request to NIM timed out (5 min limit reached)" : err.message,
+        type: isTimeout ? "timeout" : "proxy_error",
       }
     });
-  });
-
-  nimReq.on("error", (e) => {
-    console.error("NIM request error:", e.message);
-    res.status(500).json({ error: { message: e.message, type: "proxy_error" } });
-  });
-
-  nimReq.setTimeout(120000, () => {
-    nimReq.destroy();
-    res.status(504).json({ error: { message: "Request to NIM timed out", type: "timeout" } });
-  });
-
-  nimReq.write(bodyStr);
-  nimReq.end();
+  }
 });
 
-// /v1/models so Janitor AI can validate the connection
-app.get("/v1/models", (req, res) => {
+// ─── GET /v1/models ───────────────────────────────────────────────────────────
+app.get("/v1/models", async (req, res) => {
   const authHeader = req.headers["authorization"] || req.headers["x-api-key"] || "";
   const apiKey = authHeader.replace(/^Bearer\s+/i, "").trim();
 
-  const options = {
-    hostname: NIM_HOST,
-    path: `${NIM_BASE_PATH}/models`,
-    method: "GET",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Accept": "application/json",
-    },
-  };
-
-  const nimReq = https.request(options, (nimRes) => {
-    let data = "";
-    nimRes.on("data", (chunk) => { data += chunk; });
-    nimRes.on("end", () => {
-      try {
-        res.status(nimRes.statusCode).json(JSON.parse(data));
-      } catch (e) {
-        res.status(500).json({ error: "Failed to parse models response" });
-      }
-    });
-  });
-  nimReq.on("error", (e) => res.status(500).json({ error: e.message }));
-  nimReq.end();
+  try {
+    const { status, body } = await nimRequest("/models", "GET", apiKey, null);
+    try {
+      res.status(status).json(JSON.parse(body));
+    } catch (_) {
+      res.status(500).json({ error: "Failed to parse models response" });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(PORT, () => console.log(`NIM proxy running on port ${PORT}`));

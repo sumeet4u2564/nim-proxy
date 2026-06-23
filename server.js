@@ -56,7 +56,6 @@ function nimRequest(path, method, apiKey, bodyStr) {
       }
     );
     req.on("error", reject);
-    req.setTimeout(300_000, () => { req.destroy(); reject(new Error("timeout")); });
     if (bodyStr) req.write(bodyStr);
     req.end();
   });
@@ -98,13 +97,6 @@ function nimStreamRequest(path, apiKey, bodyStr, res) {
     );
 
     req.on("error", reject);
-
-    // 5-minute hard timeout — enough for the longest DeepSeek responses
-    req.setTimeout(300_000, () => {
-      req.destroy();
-      reject(new Error("NIM stream timed out after 5 minutes"));
-    });
-
     req.write(bodyStr);
     req.end();
   });
@@ -207,12 +199,8 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
   } catch (err) {
     console.error("NIM request error:", err.message);
-    const isTimeout = err.message === "timeout";
-    res.status(isTimeout ? 504 : 500).json({
-      error: {
-        message: isTimeout ? "Request to NIM timed out (5 min limit reached)" : err.message,
-        type: isTimeout ? "timeout" : "proxy_error",
-      }
+    res.status(500).json({
+      error: { message: err.message, type: "proxy_error" }
     });
   }
 });

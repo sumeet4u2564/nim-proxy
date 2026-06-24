@@ -56,6 +56,7 @@ function nimRequest(path, method, apiKey, bodyStr) {
       }
     );
     req.on("error", reject);
+    req.setTimeout(300_000, () => { req.destroy(); reject(new Error("timeout")); });
     if (bodyStr) req.write(bodyStr);
     req.end();
   });
@@ -78,7 +79,10 @@ function nimStreamRequest(path, apiKey, bodyStr, res) {
         if (nimRes.statusCode !== 200) {
           let errData = "";
           nimRes.on("data", (c) => { errData += c; });
-          nimRes.on("end", () => reject({ status: nimRes.statusCode, body: errData }));
+          nimRes.on("end", () => {
+            console.error(`← NIM error | status: ${nimRes.statusCode} | body: ${errData || "(empty)"}`);
+            reject({ status: nimRes.statusCode, body: errData });
+          });
           return;
         }
 
@@ -97,6 +101,10 @@ function nimStreamRequest(path, apiKey, bodyStr, res) {
     );
 
     req.on("error", reject);
+    req.setTimeout(300_000, () => {
+      req.destroy();
+      reject(new Error("NIM stream timed out after 5 minutes"));
+    });
     req.write(bodyStr);
     req.end();
   });
